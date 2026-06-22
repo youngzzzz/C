@@ -4,12 +4,29 @@ import { withConfig } from './modelConfig.js'
 import { parseLenient } from './jsonutil.js'
 
 const BACKEND_DOWN =
-  '后端未连接或为旧版本（/api 返回了 HTML）。请重启后端：先结束占用 8787 端口的旧进程（lsof -ti tcp:8787 | xargs kill -9），再运行 npm run dev。'
+  'API 不可用：服务器返回了 HTML 页面而非 JSON。生产环境请确认 Vercel 已部署 /api 后端；本地请运行 npm run dev 并确保 8787 端口可用。'
 
-// If the proxy falls through to the SPA, we get text/html instead of our JSON/stream.
+// If the proxy falls through to the SPA or CDN 404, we get text/html instead of our JSON/stream.
 function assertApi(res) {
   const ct = res.headers.get('content-type') || ''
   if (ct.includes('text/html')) throw new Error(BACKEND_DOWN)
+}
+
+async function readJSON(res) {
+  const text = await res.text()
+  const trimmed = text.trimStart()
+  if (
+    trimmed.startsWith('<!') ||
+    trimmed.startsWith('<') ||
+    /^The page /i.test(trimmed)
+  ) {
+    throw new Error(BACKEND_DOWN)
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`API 返回非 JSON：${text.slice(0, 120)}`)
+  }
 }
 
 export async function streamChat({ system, messages, model, provider, effort, max_tokens, onText, signal }) {
@@ -125,7 +142,7 @@ export async function genSlides(md) {
     body: JSON.stringify(withConfig({ md })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -137,7 +154,7 @@ export async function prdOutline(product) {
     body: JSON.stringify(withConfig({ product })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -149,7 +166,7 @@ export async function prdSection({ product, outline, chapter }) {
     body: JSON.stringify(withConfig({ product, outline, chapter })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data.text
 }
@@ -161,7 +178,7 @@ export async function complete({ system, messages, model, provider, effort, max_
     body: JSON.stringify(withConfig({ system, messages, model, provider, effort, max_tokens, format })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data.text
 }
@@ -175,7 +192,7 @@ export async function completeJSON({ system, messages, format, model, provider, 
 async function postJSON(path, body) {
   const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withConfig(body)) })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -192,7 +209,7 @@ export async function advise(product, goal) {
     body: JSON.stringify(withConfig({ product, goal })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -204,7 +221,7 @@ export async function analyzeCompetitor({ name, url, notes }) {
     body: JSON.stringify(withConfig({ name, url, notes })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -216,7 +233,7 @@ export async function compareCompetitors(products) {
     body: JSON.stringify(withConfig({ products })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
@@ -228,7 +245,7 @@ export async function answer(query) {
     body: JSON.stringify(withConfig({ query })),
   })
   assertApi(res)
-  const data = await res.json()
+  const data = await readJSON(res)
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
   return data
 }
