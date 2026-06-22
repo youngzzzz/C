@@ -83,8 +83,8 @@ export default function SettingsModal({ onClose }) {
 
         {cfg.provider === 'deepseek' && (
           <div className="cfg-note">
-            DeepSeek 走 OpenAI 兼容协议。注意：<strong>答案引擎</strong>（联网检索）目前仅 Claude 支持，
-            DeepSeek 会自动降级为模型内置知识回答。
+            DeepSeek 走 OpenAI 兼容协议；<strong>答案引擎/竞品研究</strong>的联网检索会自动改走
+            DeepSeek 的 Anthropic 端点调用其原生 web_search，无需额外配置。检索不可用时降级为模型内置知识。
           </div>
         )}
 

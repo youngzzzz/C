@@ -1,6 +1,6 @@
 import express from 'express'
 import { jsonrepair } from 'jsonrepair'
-import { streamText, completeText, resolve, anthropicClient } from './providers.js'
+import { streamText, completeText, webSearchSetup } from './providers.js'
 
 // Tolerant parse for model-produced JSON: strip fences/prose, repair bad commas & truncation.
 function parseModelJson(text) {
@@ -395,7 +395,7 @@ app.post('/api/complete', async (req, res) => {
   }
 })
 
-// --- Answer engine: web search (Claude only) with graceful fallback ---
+// --- Answer engine: server-side web search (Claude & DeepSeek) with graceful fallback ---
 const ANSWER_SYS =
   '你是一个答案引擎。先用 web_search 检索最新信息，再用中文给出结构化、准确、简洁的回答：' +
   '开头一句话直接结论，然后分点展开，必要时给出数字与时间。不要复述问题。'
@@ -403,51 +403,44 @@ const ANSWER_SYS_NOWEB =
   '你是一个答案引擎。用中文给出结构化、准确、简洁的回答：开头一句话直接结论，然后分点展开。' +
   '如果信息可能过时，请明确说明。不要复述问题。'
 
+// Run a web-search-backed turn over the Anthropic Messages protocol (Claude or DeepSeek /anthropic),
+// looping through pause_turn pauses. Returns { text, sources }.
+async function webSearchTurn(b, { system, query, max_tokens = 2048, maxLoops = 4 }) {
+  const { client, model, tools } = webSearchSetup(b)
+  let messages = [{ role: 'user', content: query }]
+  let resp = await client.messages.create({ model, max_tokens, system, tools, messages })
+  let guard = 0
+  while (resp.stop_reason === 'pause_turn' && guard++ < maxLoops) {
+    messages = [{ role: 'user', content: query }, { role: 'assistant', content: resp.content }]
+    resp = await client.messages.create({ model, max_tokens, system, tools, messages })
+  }
+  const text = resp.content.filter((x) => x.type === 'text').map((x) => x.text).join('')
+  const seen = new Set()
+  const sources = []
+  for (const blk of resp.content) {
+    if (blk.type === 'text' && Array.isArray(blk.citations)) {
+      for (const c of blk.citations) {
+        if (c?.url && !seen.has(c.url)) {
+          seen.add(c.url)
+          sources.push({ title: c.title || c.url, url: c.url })
+        }
+      }
+    }
+  }
+  return { text, sources }
+}
+
 app.post('/api/answer', async (req, res) => {
   const b = req.body || {}
   const query = (b.query || '').toString().slice(0, 2000)
   if (!query.trim()) return res.status(400).json({ error: 'empty query' })
-  const { provider } = resolve(b)
 
-  // DeepSeek has no server-side web search tool → answer from model knowledge.
-  if (provider === 'deepseek') {
-    try {
-      const text = await completeText({ ...b, system: ANSWER_SYS_NOWEB, messages: [{ role: 'user', content: query }], max_tokens: 2048, format: null })
-      return res.json({ text, sources: [], note: 'DeepSeek 暂不支持联网检索，已用模型内置知识回答（可能不含最新信息）。' })
-    } catch (e) {
-      return res.status(500).json({ error: e?.message || String(e) })
-    }
-  }
-
-  // Claude path: real web search.
-  const client = anthropicClient(b)
-  const model = b.model || 'claude-opus-4-8'
-  const tools = [{ type: 'web_search_20260209', name: 'web_search' }]
   try {
-    let messages = [{ role: 'user', content: query }]
-    let resp = await client.messages.create({ model, max_tokens: 2048, system: ANSWER_SYS, tools, messages })
-    let guard = 0
-    while (resp.stop_reason === 'pause_turn' && guard++ < 4) {
-      messages = [{ role: 'user', content: query }, { role: 'assistant', content: resp.content }]
-      resp = await client.messages.create({ model, max_tokens: 2048, system: ANSWER_SYS, tools, messages })
-    }
-    const text = resp.content.filter((x) => x.type === 'text').map((x) => x.text).join('')
-    const seen = new Set()
-    const sources = []
-    for (const blk of resp.content) {
-      if (blk.type === 'text' && Array.isArray(blk.citations)) {
-        for (const c of blk.citations) {
-          if (c?.url && !seen.has(c.url)) {
-            seen.add(c.url)
-            sources.push({ title: c.title || c.url, url: c.url })
-          }
-        }
-      }
-    }
+    const { text, sources } = await webSearchTurn(b, { system: ANSWER_SYS, query })
     res.json({ text, sources })
   } catch (e) {
     try {
-      const text = await completeText({ ...b, system: ANSWER_SYS_NOWEB, messages: [{ role: 'user', content: query }], max_tokens: 2048 })
+      const text = await completeText({ ...b, system: ANSWER_SYS_NOWEB, messages: [{ role: 'user', content: query }], max_tokens: 2048, format: null })
       res.json({ text, sources: [], note: 'web search 不可用，已改用模型内置知识回答（可能不含最新信息）。' })
     } catch (e2) {
       res.status(500).json({ error: e2?.message || String(e2) })
@@ -595,41 +588,22 @@ app.post('/api/compete', async (req, res) => {
   const name = (b.name || '').toString().slice(0, 200)
   if (!name.trim()) return res.status(400).json({ error: '请填写产品名' })
   const query = `产品：${name}\n官网/链接：${b.url || '(未提供)'}\n补充说明：${b.notes || '(无)'}`
-  const { provider } = resolve(b)
 
-  // Phase A: research (real web search on Claude; knowledge fallback otherwise)
+  // Phase A: research via server-side web search (Claude & DeepSeek); knowledge fallback otherwise
   let dossier = ''
-  const sources = []
+  let sources = []
   let note = ''
-  if (provider === 'anthropic') {
-    try {
-      const client = anthropicClient(b)
-      const model = b.model || 'claude-opus-4-8'
-      const tools = [{ type: 'web_search_20260209', name: 'web_search' }]
-      let messages = [{ role: 'user', content: query }]
-      let resp = await client.messages.create({ model, max_tokens: 1800, system: RESEARCH_SYS, tools, messages })
-      let guard = 0
-      while (resp.stop_reason === 'pause_turn' && guard++ < 4) {
-        messages = [{ role: 'user', content: query }, { role: 'assistant', content: resp.content }]
-        resp = await client.messages.create({ model, max_tokens: 1800, system: RESEARCH_SYS, tools, messages })
-      }
-      dossier = resp.content.filter((x) => x.type === 'text').map((x) => x.text).join('')
-      const seen = new Set()
-      for (const blk of resp.content) {
-        if (blk.type === 'text' && Array.isArray(blk.citations)) {
-          for (const c of blk.citations) {
-            if (c?.url && !seen.has(c.url)) { seen.add(c.url); sources.push({ title: c.title || c.url, url: c.url }) }
-          }
-        }
-      }
-    } catch (e) {
-      dossier = ''
-    }
+  try {
+    const r = await webSearchTurn(b, { system: RESEARCH_SYS, query, max_tokens: 1800 })
+    dossier = r.text
+    sources = r.sources
+  } catch (e) {
+    dossier = ''
   }
   if (!dossier) {
     try {
       dossier = await completeText({ ...b, system: RESEARCH_SYS_NOWEB, messages: [{ role: 'user', content: query }], max_tokens: 1500 })
-      note = provider === 'anthropic' ? 'web 检索不可用，已用模型内置知识分析（可能不含最新信息）。' : 'DeepSeek 暂不支持联网，已用模型内置知识分析（可能不含最新信息）。'
+      note = 'web 检索不可用，已用模型内置知识分析（可能不含最新信息）。'
     } catch (e) {
       return res.status(500).json({ error: e?.message || String(e) })
     }
@@ -667,34 +641,17 @@ app.post('/api/compete', async (req, res) => {
 // --- Multi-product comparison ---
 async function researchProduct(b, p) {
   const query = `产品：${p.name}\n官网/链接：${p.url || '(未提供)'}\n补充：${p.notes || '(无)'}`
-  const { provider } = resolve(b)
   let dossier = ''
-  const sources = []
+  let sources = []
   let note = ''
-  if (provider === 'anthropic') {
-    try {
-      const client = anthropicClient(b)
-      const model = b.model || 'claude-opus-4-8'
-      const tools = [{ type: 'web_search_20260209', name: 'web_search' }]
-      let messages = [{ role: 'user', content: query }]
-      let resp = await client.messages.create({ model, max_tokens: 1500, system: RESEARCH_SYS, tools, messages })
-      let g = 0
-      while (resp.stop_reason === 'pause_turn' && g++ < 3) {
-        messages = [{ role: 'user', content: query }, { role: 'assistant', content: resp.content }]
-        resp = await client.messages.create({ model, max_tokens: 1500, system: RESEARCH_SYS, tools, messages })
-      }
-      dossier = resp.content.filter((x) => x.type === 'text').map((x) => x.text).join('')
-      const seen = new Set()
-      for (const blk of resp.content) {
-        if (blk.type === 'text' && Array.isArray(blk.citations)) {
-          for (const c of blk.citations) { if (c?.url && !seen.has(c.url)) { seen.add(c.url); sources.push({ title: c.title || c.url, url: c.url }) } }
-        }
-      }
-    } catch { dossier = '' }
-  }
+  try {
+    const r = await webSearchTurn(b, { system: RESEARCH_SYS, query, max_tokens: 1500, maxLoops: 3 })
+    dossier = r.text
+    sources = r.sources
+  } catch { dossier = '' }
   if (!dossier) {
     dossier = await completeText({ ...b, system: RESEARCH_SYS_NOWEB, messages: [{ role: 'user', content: query }], max_tokens: 1200 })
-    note = provider === 'anthropic' ? 'web 检索部分不可用，含模型内置知识。' : 'DeepSeek 暂不支持联网，用模型内置知识。'
+    note = 'web 检索部分不可用，含模型内置知识。'
   }
   return { dossier, sources, note }
 }

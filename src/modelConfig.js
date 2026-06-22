@@ -17,8 +17,8 @@ export const PROVIDERS = {
     baseURLPlaceholder: '默认 https://api.deepseek.com',
     keyHint: '在 platform.deepseek.com 获取，留空则用服务端 DEEPSEEK_API_KEY',
     models: [
-      { id: 'deepseek-chat', name: 'DeepSeek-V3 · chat' },
-      { id: 'deepseek-reasoner', name: 'DeepSeek-R1 · reasoner' },
+      { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash · 快/省' },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro · 最强' },
     ],
   },
 }
